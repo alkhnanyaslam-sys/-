@@ -5,12 +5,11 @@ import tempfile
 import shutil
 import time
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
-    CallbackQueryHandler,
     ContextTypes,
     filters,
 )
@@ -60,20 +59,24 @@ def is_youtube_url(text: str) -> bool:
     return "youtube.com" in text or "youtu.be" in text
 
 
-def get_formats(url: str):
-    ydl_opts = {"quiet": True, "skip_download": True}
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        return ydl.extract_info(url, download=False)
-
-
-def download_video(url: str, format_id: str, out_dir: str) -> str:
+def download_video(url: str, out_dir: str) -> str:
+    """يحمل الفيديو على طول بأفضل جودة تحت حد تليجرام، من غير ما يجيب المعلومات الأول"""
     out_template = os.path.join(out_dir, "%(title).80s.%(ext)s")
     ydl_opts = {
-        "format": f"{format_id}+bestaudio/best" if format_id != "bestaudio" else "bestaudio",
+        "format": (
+            "bestvideo[ext=mp4][filesize<45M]+bestaudio[ext=m4a]"
+            "/best[ext=mp4][filesize<45M]"
+            "/best[filesize<45M]"
+            "/best"
+        ),
         "outtmpl": out_template,
         "merge_output_format": "mp4",
         "quiet": True,
         "noplaylist": True,
+        # بيخلي yt-dlp يتصرف كإنه تطبيق يوتيوب على أندرويد
+        # عشان يتخطى مشكلة "Sign in to confirm you're not a bot"
+        # اللي بتحصل مع الأي بيهات بتاعة سيرفرات GitHub Actions
+        "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
@@ -91,7 +94,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         "أهلاً بيك 👋\n"
-        "ابعتلي رابط فيديو من يوتيوب وهختارلك الجودة المناسبة وأحمله."
+        "ابعتلي رابط فيديو من يوتيوب وهحمله على طول."
     )
 
 
@@ -104,85 +107,29 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("ابعت رابط يوتيوب صحيح من فضلك.")
         return
 
-    msg = await update.message.reply_text("⏳ بجيب معلومات الفيديو...")
-
-    try:
-        info = get_formats(text)
-    except Exception as e:
-        logger.exception("extract_info failed")
-        await msg.edit_text(f"❌ مقدرتش أجيب معلومات الفيديو: {e}")
-        return
-
-    context.user_data["url"] = text
-    context.user_data["title"] = info.get("title", "video")
-
-    seen = set()
-    buttons = []
-    for f in info.get("formats", []):
-        height = f.get("height")
-        ext = f.get("ext")
-        format_id = f.get("format_id")
-        filesize = f.get("filesize") or f.get("filesize_approx")
-        if not height or ext != "mp4" or not format_id:
-            continue
-        if height in seen:
-            continue
-        seen.add(height)
-        size_txt = f" (~{filesize / 1_000_000:.0f}MB)" if filesize else ""
-        buttons.append(
-            InlineKeyboardButton(f"{height}p{size_txt}", callback_data=f"dl|{format_id}")
-        )
-
-    buttons.sort(key=lambda b: int(b.text.split("p")[0]))
-    buttons.append(InlineKeyboardButton("🎵 صوت فقط (MP3)", callback_data="dl|bestaudio"))
-
-    if not buttons:
-        await msg.edit_text("❌ مفيش جودات متاحة للفيديو ده.")
-        return
-
-    keyboard = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
-    await msg.edit_text(
-        f"🎬 {info.get('title')}\nاختار الجودة:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
-
-
-async def handle_quality_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    _, format_id = query.data.split("|")
-    url = context.user_data.get("url")
-    if not url:
-        await query.edit_message_text("❌ الرابط راح، ابعته تاني.")
-        return
-
-    await query.edit_message_text("⏳ بحمل الفيديو، استنى شوية...")
+    msg = await update.message.reply_text("⏳ بحمل الفيديو، استنى شوية...")
 
     tmp_dir = tempfile.mkdtemp()
     try:
-        filepath = download_video(url, format_id, tmp_dir)
+        filepath = download_video(text, tmp_dir)
         size_mb = os.path.getsize(filepath) / 1_000_000
 
         if size_mb > MAX_TELEGRAM_FILE_MB:
-            await query.edit_message_text(
-                f"❌ حجم الملف {size_mb:.0f}MB وده أكبر من حد تليجرام "
-                f"({MAX_TELEGRAM_FILE_MB}MB). جرب جودة أقل."
+            await msg.edit_text(
+                f"❌ حجم الفيديو {size_mb:.0f}MB وده أكبر من حد تليجرام "
+                f"({MAX_TELEGRAM_FILE_MB}MB)، مقدرش أبعته."
             )
             return
 
-        await query.edit_message_text("📤 بترفع الملف...")
+        await msg.edit_text("📤 بترفع الفيديو...")
         with open(filepath, "rb") as f:
-            if format_id == "bestaudio":
-                await context.bot.send_audio(chat_id=query.message.chat_id, audio=f)
-            else:
-                await context.bot.send_video(
-                    chat_id=query.message.chat_id, video=f, supports_streaming=True
-                )
-        await query.edit_message_text("✅ تم التحميل بنجاح.")
+            await context.bot.send_video(
+                chat_id=update.effective_chat.id, video=f, supports_streaming=True
+            )
+        await msg.edit_text("✅ تم التحميل بنجاح.")
     except Exception as e:
         logger.exception("download failed")
-        await query.edit_message_text(f"❌ حصل خطأ أثناء التحميل: {e}")
+        await msg.edit_text(f"❌ حصل خطأ أثناء التحميل: {e}")
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -262,7 +209,6 @@ def main():
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("broadcast", broadcast))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
-    app.add_handler(CallbackQueryHandler(handle_quality_choice))
 
     logger.info("Bot is running...")
     app.run_polling(close_loop=False)
