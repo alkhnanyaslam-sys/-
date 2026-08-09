@@ -24,8 +24,8 @@ ADMIN_ID = 8355232956
 USERS_FILE = os.path.join(os.path.dirname(__file__), "users.json")
 COOKIES_FILE = os.path.join(os.path.dirname(__file__), "cookies.txt")
 
-# سيرفر البوت المحلي (Local Bot API) عشان نتخطى حد الـ50 ميجا
 LOCAL_API_HOST = os.environ.get("LOCAL_API_HOST", "http://localhost:8081")
+PROXY_URL = os.environ.get("PROXY_URL")  # اختياري: http://user:pass@host:port
 
 MAX_RUNTIME_SECONDS = int(os.environ.get("MAX_RUNTIME_SECONDS", 5 * 60 * 60 + 45 * 60))
 
@@ -35,17 +35,31 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+COOKIES_READY = False
 
-# ------------------ إعداد ملف الكوكيز من متغير بيئة base64 ------------------
+
+# ------------------ إعداد ملف الكوكيز مع تشخيص واضح ------------------
 def setup_cookies():
+    global COOKIES_READY
     b64 = os.environ.get("YT_COOKIES_B64")
-    if b64:
-        try:
-            with open(COOKIES_FILE, "wb") as f:
-                f.write(base64.b64decode(b64))
-            logger.info("تم إعداد ملف الكوكيز")
-        except Exception:
-            logger.exception("فشل فك تشفير الكوكيز")
+    if not b64:
+        logger.warning(
+            "⚠️ متغير YT_COOKIES_B64 مش موجود خالص — البوت هيشتغل من غير كوكيز "
+            "وده معناه احتمال يفشل مع رسالة Sign in عالي جدًا."
+        )
+        return
+    try:
+        raw = base64.b64decode(b64)
+        with open(COOKIES_FILE, "wb") as f:
+            f.write(raw)
+        size = os.path.getsize(COOKIES_FILE)
+        if size < 100:
+            logger.warning(f"⚠️ ملف الكوكيز صغير جدًا ({size} بايت) — يبدو فاسد أو فاضي.")
+        else:
+            logger.info(f"✅ تم تحميل ملف الكوكيز بنجاح ({size} بايت).")
+            COOKIES_READY = True
+    except Exception:
+        logger.exception("❌ فشل فك تشفير الكوكيز — تأكد إن القيمة base64 صحيحة.")
 
 
 # ------------------ تخزين المستخدمين ------------------
@@ -82,13 +96,14 @@ def _base_opts():
         "noplaylist": True,
         "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
     }
-    if os.path.exists(COOKIES_FILE):
+    if os.path.exists(COOKIES_FILE) and os.path.getsize(COOKIES_FILE) > 100:
         opts["cookiefile"] = COOKIES_FILE
+    if PROXY_URL:
+        opts["proxy"] = PROXY_URL
     return opts
 
 
 def download_video(url: str, out_dir: str) -> str:
-    """يحمل أفضل جودة فيديو متاحة، من غير حد حجم (السيرفر المحلي بيسمح لحد 2GB)"""
     out_template = os.path.join(out_dir, "%(title).80s.%(ext)s")
     opts = _base_opts()
     opts.update(
@@ -108,7 +123,6 @@ def download_video(url: str, out_dir: str) -> str:
 
 
 def download_audio(url: str, out_dir: str) -> str:
-    """يحمل الصوت بس بأفضل جودة"""
     out_template = os.path.join(out_dir, "%(title).80s.%(ext)s")
     opts = _base_opts()
     opts.update(
@@ -173,7 +187,7 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("❌ الرابط راح، ابعته تاني.")
         return
 
-    await query.edit_message_text("⏳ بحمل، استنى شوية (ممكن ياخد وقت حسب حجم الفيديو)...")
+    await query.edit_message_text("⏳ بحمل، استنى شوية...")
 
     tmp_dir = tempfile.mkdtemp()
     try:
@@ -195,7 +209,14 @@ async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("✅ تم بنجاح.")
     except Exception as e:
         logger.exception("download failed")
-        await query.edit_message_text(f"❌ حصل خطأ أثناء التحميل: {e}")
+        hint = ""
+        if "Sign in to confirm" in str(e):
+            hint = (
+                "\n\nℹ️ ده معناه إن يوتيوب حاجب الـ IP الحالي. "
+                + ("الكوكيز متحملة بس برضه اتحجب — جرب بروكسي." if COOKIES_READY
+                   else "الكوكيز مش متحملة أصلاً — تأكد من السيكريت YT_COOKIES_B64.")
+            )
+        await query.edit_message_text(f"❌ حصل خطأ أثناء التحميل: {e}{hint}")
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -215,6 +236,17 @@ def admin_only(func):
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     users = context.bot_data.setdefault("users", load_users())
     await update.message.reply_text(f"👥 عدد المستخدمين: {len(users)}")
+
+
+@admin_only
+async def cookiestatus(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if COOKIES_READY:
+        size = os.path.getsize(COOKIES_FILE)
+        await update.message.reply_text(f"✅ الكوكيز متحملة ({size} بايت).")
+    else:
+        await update.message.reply_text(
+            "❌ الكوكيز مش متحملة. تأكد إن السيكريت YT_COOKIES_B64 مضاف وقيمته صحيحة."
+        )
 
 
 @admin_only
@@ -280,6 +312,7 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("stats", stats))
+    app.add_handler(CommandHandler("cookiestatus", cookiestatus))
     app.add_handler(CommandHandler("broadcast", broadcast))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
     app.add_handler(CallbackQueryHandler(handle_choice))
