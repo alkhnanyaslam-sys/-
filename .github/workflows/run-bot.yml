@@ -17,6 +17,16 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 355
 
+    services:
+      telegram-bot-api:
+        image: aiogram/telegram-bot-api:latest
+        ports:
+          - 8081:8081
+        env:
+          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+          TELEGRAM_LOCAL: "true"
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -26,11 +36,16 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Install ffmpeg (للتحويل لصوت mp3)
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
       - name: Install dependencies
         run: pip install -r requirements.txt
 
       - name: Run bot
         env:
+          YT_COOKIES_B64: ${{ secrets.YT_COOKIES_B64 }}
+          LOCAL_API_HOST: "http://localhost:8081"
           MAX_RUNTIME_SECONDS: "20700"
         run: python bot.py
 
