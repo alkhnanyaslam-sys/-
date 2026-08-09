@@ -36,7 +36,7 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install ffmpeg (للتحويل لصوت mp3)
+      - name: Install ffmpeg
         run: sudo apt-get update && sudo apt-get install -y ffmpeg
 
       - name: Install dependencies
@@ -45,6 +45,7 @@ jobs:
       - name: Run bot
         env:
           YT_COOKIES_B64: ${{ secrets.YT_COOKIES_B64 }}
+          PROXY_URL: ${{ secrets.PROXY_URL }}
           LOCAL_API_HOST: "http://localhost:8081"
           MAX_RUNTIME_SECONDS: "20700"
         run: python bot.py
