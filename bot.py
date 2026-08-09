@@ -1,15 +1,17 @@
 import os
 import json
+import base64
 import logging
 import tempfile
 import shutil
 import time
 
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
     ContextTypes,
     filters,
 )
@@ -18,17 +20,32 @@ import yt_dlp
 # ------------------ الإعدادات ------------------
 BOT_TOKEN = "8751872695:AAFRuqRCi2Lyf-9u728NvYJxjrZ-qhmtRjA"
 
-ADMIN_ID = 8355232956  # الأونر الوحيد اللي يقدر يتحكم في البوت
-MAX_TELEGRAM_FILE_MB = 50  # حد تليجرام العادي للبوتات
+ADMIN_ID = 8355232956
 USERS_FILE = os.path.join(os.path.dirname(__file__), "users.json")
+COOKIES_FILE = os.path.join(os.path.dirname(__file__), "cookies.txt")
 
-MAX_RUNTIME_SECONDS = int(os.environ.get("MAX_RUNTIME_SECONDS", 5 * 60 * 60 + 45 * 60))  # 5س 45د
+# سيرفر البوت المحلي (Local Bot API) عشان نتخطى حد الـ50 ميجا
+LOCAL_API_HOST = os.environ.get("LOCAL_API_HOST", "http://localhost:8081")
+
+MAX_RUNTIME_SECONDS = int(os.environ.get("MAX_RUNTIME_SECONDS", 5 * 60 * 60 + 45 * 60))
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+
+
+# ------------------ إعداد ملف الكوكيز من متغير بيئة base64 ------------------
+def setup_cookies():
+    b64 = os.environ.get("YT_COOKIES_B64")
+    if b64:
+        try:
+            with open(COOKIES_FILE, "wb") as f:
+                f.write(base64.b64decode(b64))
+            logger.info("تم إعداد ملف الكوكيز")
+        except Exception:
+            logger.exception("فشل فك تشفير الكوكيز")
 
 
 # ------------------ تخزين المستخدمين ------------------
@@ -38,7 +55,7 @@ def load_users() -> set:
             with open(USERS_FILE, "r", encoding="utf-8") as f:
                 return set(json.load(f))
         except (json.JSONDecodeError, OSError):
-            logger.warning("users.json فاسد أو مش موجود، هبدأ بقائمة فاضية")
+            logger.warning("users.json فاسد أو مش موجود")
     return set()
 
 
@@ -59,26 +76,29 @@ def is_youtube_url(text: str) -> bool:
     return "youtube.com" in text or "youtu.be" in text
 
 
-def download_video(url: str, out_dir: str) -> str:
-    """يحمل الفيديو على طول بأفضل جودة تحت حد تليجرام، من غير ما يجيب المعلومات الأول"""
-    out_template = os.path.join(out_dir, "%(title).80s.%(ext)s")
-    ydl_opts = {
-        "format": (
-            "bestvideo[ext=mp4][filesize<45M]+bestaudio[ext=m4a]"
-            "/best[ext=mp4][filesize<45M]"
-            "/best[filesize<45M]"
-            "/best"
-        ),
-        "outtmpl": out_template,
-        "merge_output_format": "mp4",
+def _base_opts():
+    opts = {
         "quiet": True,
         "noplaylist": True,
-        # بيخلي yt-dlp يتصرف كإنه تطبيق يوتيوب على أندرويد
-        # عشان يتخطى مشكلة "Sign in to confirm you're not a bot"
-        # اللي بتحصل مع الأي بيهات بتاعة سيرفرات GitHub Actions
         "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
     }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+    if os.path.exists(COOKIES_FILE):
+        opts["cookiefile"] = COOKIES_FILE
+    return opts
+
+
+def download_video(url: str, out_dir: str) -> str:
+    """يحمل أفضل جودة فيديو متاحة، من غير حد حجم (السيرفر المحلي بيسمح لحد 2GB)"""
+    out_template = os.path.join(out_dir, "%(title).80s.%(ext)s")
+    opts = _base_opts()
+    opts.update(
+        {
+            "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+            "outtmpl": out_template,
+            "merge_output_format": "mp4",
+        }
+    )
+    with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=True)
         filepath = ydl.prepare_filename(info)
         if not os.path.exists(filepath):
@@ -87,14 +107,37 @@ def download_video(url: str, out_dir: str) -> str:
     return filepath
 
 
+def download_audio(url: str, out_dir: str) -> str:
+    """يحمل الصوت بس بأفضل جودة"""
+    out_template = os.path.join(out_dir, "%(title).80s.%(ext)s")
+    opts = _base_opts()
+    opts.update(
+        {
+            "format": "bestaudio/best",
+            "outtmpl": out_template,
+            "postprocessors": [
+                {
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "mp3",
+                    "preferredquality": "192",
+                }
+            ],
+        }
+    )
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        filepath = ydl.prepare_filename(info)
+        base, _ = os.path.splitext(filepath)
+        mp3_path = base + ".mp3"
+        return mp3_path if os.path.exists(mp3_path) else filepath
+
+
 # ------------------ Handlers عامة ------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     users = context.bot_data.setdefault("users", load_users())
     register_user(update.effective_user.id, users)
-
     await update.message.reply_text(
-        "أهلاً بيك 👋\n"
-        "ابعتلي رابط فيديو من يوتيوب وهحمله على طول."
+        "أهلاً بيك 👋\nابعتلي رابط فيديو من يوتيوب واختار فيديو ولا صوت."
     )
 
 
@@ -107,29 +150,52 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("ابعت رابط يوتيوب صحيح من فضلك.")
         return
 
-    msg = await update.message.reply_text("⏳ بحمل الفيديو، استنى شوية...")
+    context.user_data["url"] = text
+
+    keyboard = [
+        [
+            InlineKeyboardButton("🎥 فيديو", callback_data="video"),
+            InlineKeyboardButton("🎵 صوت", callback_data="audio"),
+        ]
+    ]
+    await update.message.reply_text(
+        "اختار هتحمل إيه:", reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    choice = query.data
+    url = context.user_data.get("url")
+    if not url:
+        await query.edit_message_text("❌ الرابط راح، ابعته تاني.")
+        return
+
+    await query.edit_message_text("⏳ بحمل، استنى شوية (ممكن ياخد وقت حسب حجم الفيديو)...")
 
     tmp_dir = tempfile.mkdtemp()
     try:
-        filepath = download_video(text, tmp_dir)
+        if choice == "audio":
+            filepath = download_audio(url, tmp_dir)
+        else:
+            filepath = download_video(url, tmp_dir)
+
         size_mb = os.path.getsize(filepath) / 1_000_000
+        await query.edit_message_text(f"📤 بترفع الملف ({size_mb:.0f}MB)...")
 
-        if size_mb > MAX_TELEGRAM_FILE_MB:
-            await msg.edit_text(
-                f"❌ حجم الفيديو {size_mb:.0f}MB وده أكبر من حد تليجرام "
-                f"({MAX_TELEGRAM_FILE_MB}MB)، مقدرش أبعته."
-            )
-            return
-
-        await msg.edit_text("📤 بترفع الفيديو...")
         with open(filepath, "rb") as f:
-            await context.bot.send_video(
-                chat_id=update.effective_chat.id, video=f, supports_streaming=True
-            )
-        await msg.edit_text("✅ تم التحميل بنجاح.")
+            if choice == "audio":
+                await context.bot.send_audio(chat_id=query.message.chat_id, audio=f)
+            else:
+                await context.bot.send_video(
+                    chat_id=query.message.chat_id, video=f, supports_streaming=True
+                )
+        await query.edit_message_text("✅ تم بنجاح.")
     except Exception as e:
         logger.exception("download failed")
-        await msg.edit_text(f"❌ حصل خطأ أثناء التحميل: {e}")
+        await query.edit_message_text(f"❌ حصل خطأ أثناء التحميل: {e}")
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -154,7 +220,6 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @admin_only
 async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     users = context.bot_data.setdefault("users", load_users())
-
     replied = update.message.reply_to_message
     text_after_cmd = update.message.text.partition(" ")[2].strip()
 
@@ -167,7 +232,6 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     sent, failed = 0, 0
     status_msg = await update.message.reply_text("🚀 بدأ البث...")
-
     for user_id in list(users):
         try:
             if replied:
@@ -188,11 +252,10 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ------------------ إيقاف آمن بعد وقت معين ------------------
 async def shutdown_after_timeout(app: Application):
-    logger.info(f"البوت هيشتغل لحد أقصى {MAX_RUNTIME_SECONDS // 3600} ساعة تقريبًا")
     import asyncio
 
     await asyncio.sleep(MAX_RUNTIME_SECONDS)
-    logger.info("الوقت المحدد خلص، البوت بيقفل بأمان (هيشتغل تاني مع الجدولة الجاية)")
+    logger.info("الوقت خلص، البوت بيقفل بأمان")
     app.stop_running()
 
 
@@ -203,14 +266,25 @@ async def post_init(app: Application):
 
 # ------------------ التشغيل ------------------
 def main():
-    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+    setup_cookies()
+
+    builder = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .base_url(f"{LOCAL_API_HOST}/bot")
+        .base_file_url(f"{LOCAL_API_HOST}/file/bot")
+        .local_mode(True)
+        .post_init(post_init)
+    )
+    app = builder.build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("broadcast", broadcast))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
+    app.add_handler(CallbackQueryHandler(handle_choice))
 
-    logger.info("Bot is running...")
+    logger.info("Bot is running (local API mode)...")
     app.run_polling(close_loop=False)
 
 
