@@ -5,6 +5,8 @@ import logging
 import tempfile
 import shutil
 import time
+import urllib.request
+import urllib.error
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -18,7 +20,13 @@ from telegram.ext import (
 import yt_dlp
 
 # ------------------ الإعدادات ------------------
-BOT_TOKEN = "8751872695:AAFRuqRCi2Lyf-9u728NvYJxjrZ-qhmtRjA"
+# التوكن بقى بيتقرا من Environment Variable / GitHub Secret - ممنوع يتحطط هنا نص صريح تاني.
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+if not BOT_TOKEN:
+    raise RuntimeError(
+        "BOT_TOKEN غير موجود في Environment Variables. "
+        "أضفه كـ GitHub Secret ومرره في الـ workflow تحت env: للخطوة اللي بتشغل bot.py"
+    )
 
 ADMIN_ID = 8355232956
 USERS_FILE = os.path.join(os.path.dirname(__file__), "users.json")
@@ -36,6 +44,34 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 COOKIES_READY = False
+
+
+# ------------------ التأكد إن الـ Local Bot API Server جاهز فعلاً ------------------
+def wait_for_local_api(timeout_seconds: int = 60) -> bool:
+    """
+    الـ telegram-bot-api container ممكن ياخد شوية ثواني يقوم فعليًا حتى لو الـ port بقى
+    متاح على مستوى TCP. بدون الانتظار ده، أول طلب من bot.py ممكن يفشل بـ Connection Refused
+    فورًا ويوهمك إن فيه مشكلة تانية.
+    """
+    url = f"{LOCAL_API_HOST}/bot{BOT_TOKEN}/getMe"
+    deadline = time.time() + timeout_seconds
+    last_error = None
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(url, timeout=5) as resp:
+                if resp.status == 200:
+                    logger.info("✅ Local Bot API Server جاهز.")
+                    return True
+        except Exception as e:
+            last_error = e
+            time.sleep(2)
+    logger.error(
+        "❌ الـ Local Bot API Server مش رد خلال %s ثانية. آخر خطأ: %s\n"
+        "غالبًا السبب: TELEGRAM_API_ID / TELEGRAM_API_HASH مش صحيحين أو مش مضافين "
+        "كـ GitHub Secrets (لازم تاخدهم من https://my.telegram.org/apps).",
+        timeout_seconds, last_error,
+    )
+    return False
 
 
 # ------------------ إعداد ملف الكوكيز مع تشخيص واضح ------------------
@@ -60,6 +96,12 @@ def setup_cookies():
             COOKIES_READY = True
     except Exception:
         logger.exception("❌ فشل فك تشفير الكوكيز — تأكد إن القيمة base64 صحيحة.")
+
+    if not PROXY_URL:
+        logger.warning(
+            "⚠️ PROXY_URL مش متضبط. يوتيوب شبه دايمًا بيحجب IP بتاع GitHub Actions runners "
+            "حتى مع كوكيز صحيحة — البروكسي هنا مش رفاهية، هو أساسي عشان التحميل ينجح."
+        )
 
 
 # ------------------ تخزين المستخدمين ------------------
@@ -299,6 +341,12 @@ async def post_init(app: Application):
 # ------------------ التشغيل ------------------
 def main():
     setup_cookies()
+
+    if not wait_for_local_api():
+        raise RuntimeError(
+            "الـ Local Bot API Server مش شغال. راجع TELEGRAM_API_ID/TELEGRAM_API_HASH "
+            "في GitHub Secrets، وشوف Logs الخاصة بالـ service container في تبويب Actions."
+        )
 
     builder = (
         Application.builder()
