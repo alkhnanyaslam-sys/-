@@ -44,6 +44,7 @@ jobs:
 
       - name: Run bot
         env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           YT_COOKIES_B64: ${{ secrets.YT_COOKIES_B64 }}
           PROXY_URL: ${{ secrets.PROXY_URL }}
           LOCAL_API_HOST: "http://localhost:8081"
